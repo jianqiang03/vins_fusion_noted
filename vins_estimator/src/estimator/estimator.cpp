@@ -697,6 +697,7 @@ bool Estimator::initialStructure()
     }
 
     //solve pnp for all frame
+    //对于所有的图像帧，包括不在滑动窗口中的，提供初始的RT估计，然后solvePnP进行优化,得到每一帧的姿态
     map<double, ImageFrame>::iterator frame_it;
     map<int, Vector3d>::iterator it;
     frame_it = all_image_frame.begin( );
@@ -716,9 +717,11 @@ bool Estimator::initialStructure()
         {
             i++;
         }
+        //Q和T是图像帧的位姿，而不是求解PNP时所用的坐标系变换矩阵
         Matrix3d R_inital = (Q[i].inverse()).toRotationMatrix();
         Vector3d P_inital = - R_inital * T[i];
         cv::eigen2cv(R_inital, tmp_r);
+        //罗德里格斯公式将旋转矩阵转换成旋转向量
         cv::Rodrigues(tmp_r, rvec);
         cv::eigen2cv(P_inital, t);
 
@@ -743,6 +746,7 @@ bool Estimator::initialStructure()
             }
         }
         cv::Mat K = (cv::Mat_<double>(3, 3) << 1, 0, 0, 0, 1, 0, 0, 0, 1);     
+        //保证特征点数大于5
         if(pts_3_vector.size() < 6)
         {
             cout << "pts_3_vector size " << pts_3_vector.size() << endl;
@@ -817,6 +821,7 @@ bool Estimator::visualInitialAlign()
     }
 
     double s = (x.tail<1>())(0);
+    //陀螺仪的偏置bgs改变，重新计算预积分
     for (int i = 0; i <= WINDOW_SIZE; i++)
     {
         pre_integrations[i]->repropagate(Vector3d::Zero(), Bgs[i]);
@@ -833,13 +838,14 @@ bool Estimator::visualInitialAlign()
             Vs[kv] = frame_i->second.R * x.segment<3>(kv * 3);
         }
     }
-
+    //通过将重力旋转到z轴上，得到世界坐标系与摄像机坐标系c0之间的旋转矩阵rot_diff
     Matrix3d R0 = Utility::g2R(g);
     double yaw = Utility::R2ypr(R0 * Rs[0]).x();
     R0 = Utility::ypr2R(Eigen::Vector3d{-yaw, 0, 0}) * R0;
     g = R0 * g;
     //Matrix3d rot_diff = R0 * Rs[0].transpose();
     Matrix3d rot_diff = R0;
+    //所有变量从参考坐标系c0旋转到世界坐标系w
     for (int i = 0; i <= frame_count; i++)
     {
         Ps[i] = rot_diff * Ps[i];
@@ -849,7 +855,9 @@ bool Estimator::visualInitialAlign()
     ROS_WARN_STREAM("g0     " << g.transpose());
     ROS_WARN_STREAM("my R0  " << Utility::R2ypr(Rs[0]).transpose()); 
 
+    //将所有特征点的深度置为-1
     f_manager.clearDepth();
+    //重新计算特征点的深度
     f_manager.triangulate(frame_count, Ps, Rs, tic, ric);
 
     return true;
@@ -1238,28 +1246,33 @@ void Estimator::optimization()
     //如果次新帧是关键帧，将边缘化最老帧，及其看到的路标点和IMU数据，将其转化为先验： 
     if (marginalization_flag == MARGIN_OLD)
     {
+        // STEP1、新建对象(MarginalizationInfo 类保存了优化时上一步边缘化后保留下来的先验信息)
         MarginalizationInfo *marginalization_info = new MarginalizationInfo();
         vector2double();
 
-        //1、将上一次先验残差项传递给marginalization_info
+        // STEP2、添加上一次先验残差项， 将上一次先验残差项传递给 marginalization_info，将最老帧，及其看到的路标点和IMU数据，转化为先验
         if (last_marginalization_info && last_marginalization_info->valid)
         {
             vector<int> drop_set;
+            // 查询last_marginalization_parameter_blocks中是首帧状态量的序号
             for (int i = 0; i < static_cast<int>(last_marginalization_parameter_blocks.size()); i++)
             {
+                // 把 要丢弃 的状态量  para_Pose[0]、para_SpeedBias[0] 对应的序号用 drop_set 记录下来
                 if (last_marginalization_parameter_blocks[i] == para_Pose[0] ||
                     last_marginalization_parameter_blocks[i] == para_SpeedBias[0])
                     drop_set.push_back(i);
             }
             // construct new marginlization_factor
+            // 旧的先验残差项 last_marginalization_info 新建一个新的 marginalization_factor
             MarginalizationFactor *marginalization_factor = new MarginalizationFactor(last_marginalization_info);
             ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(marginalization_factor, NULL,
                                                                            last_marginalization_parameter_blocks,
                                                                            drop_set);
+            // 调用addResidualBlockInfo()函数将各个残差以及残差涉及的优化变量添加入优化变量中                                                                    
             marginalization_info->addResidualBlockInfo(residual_block_info);
         }
 
-        //2、将第0帧和第1帧间的IMU因子IMUFactor(pre_integrations[1])，添加到marginalization_info中
+        //STEP3、将窗口中第0帧和第1帧间的IMU因子IMUFactor(第0和第1帧的预积分项)，添加到marginalization_info中
         if(USE_IMU)
         {
             if (pre_integrations[1]->sum_dt < 10.0)
@@ -1272,7 +1285,7 @@ void Estimator::optimization()
             }
         }
 
-        //3、将第一次观测为第0帧的所有路标点对应的视觉观测，添加到marginalization_info中
+        //STEP4、将第一次观测为窗口中第0帧的所有路标点对应的视觉观测，添加到marginalization_info中
         {
             int feature_index = -1;
             for (auto &it_per_id : f_manager.feature)
